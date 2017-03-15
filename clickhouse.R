@@ -2,30 +2,7 @@ require(stringr)
 require(DBI)
 require(clickhouse)
 
-CONST_BASE_VORONKI <- "
-   select ring
-   from {$localSwitch}.access_log
-   where ring not in ('', 'NULL', 'N', 'deleted')
-     and length(ring) >= 32
-     and date = '{$dt}'
-     {$sample}
-   group by ring
-   having count() between 2 and 10000 and sum(is_bot) = 0
-"
-
-funnel <- list(
-  base = CONST_BASE_VORONKI,
-  step1 = list(condition = "url like '%wheel\\\\_search\\\\_set\\\\_form%'"),
-  step2 = list(condition = c("url like '%wheel\\\\_search\\\\_set\\\\_form%' and url like '%keyName=attributes-based%'",
-                             "url like '%wheel\\\\_search\\\\_set\\\\_form%' and url like '%keyName=auto-based%'")),
-  step3 = list(condition = c("url like '%/wheel/%' and url not like '%.html' and url not like '%wheelCarModel=%'",
-                             "url like '%/wheel/%' and url not like '%.html' and url like '%wheelCarModel=%'")),
-  step4 = list(condition = c("url like '%/wheel/%.html' and referrer like '%/wheel/%' and referrer not like '%wheelCarModel=%'",
-                             "url like '%/wheel/%.html' and referrer like '%/wheel/%' and referrer like '%wheelCarModel=%'"),
-               link = list(list(type = "datediff", condition = "< 60"))),
-  step5 = list(condition = "controller in ('viewContactsController::', 'FarPost/Baza/Offer/PlaceOfferController::', 'FarPost/Baza/Cart/CartController::')",
-               link = list(list(type = "field", field1 = "pathFull(referrer)", field2 = "url")))
-)
+source("bases.R")
 
 bindParams <- function(query, ...) {
   params <- list(...)
@@ -90,7 +67,7 @@ getNextLinks <- function(funnel, i = 1) {
     for (link in step$link) {
       if (link$type == "field") {
         # связь по полю
-        links <- c(links, link$field1)
+        links <- c(links, link$fieldPrevious)
       }
     }
     if (length(links) > 0) {
@@ -112,7 +89,7 @@ getPrevLinks <- function(funnel, i = 2) {
     for (link in step$link) {
       if (link$type == "field") {
         # связь по полю
-        links <- c(links, link$field2)
+        links <- c(links, link$fieldThis)
       }
     }
     if (length(links) > 0) {
@@ -126,7 +103,11 @@ getPrevLinks <- function(funnel, i = 2) {
   }
 }
 
-getInnerQuery <- function(funnel, i = 2) {
+getInnerQuery <- function(funnel, i = 2, allPath = FALSE) {
+  if (allPath) {
+    stop ("Not implemented")
+    # TODO: implement
+  }
   step <- funnel[[paste0("step", i)]]
 
   prevlinks <- getPrevLinks(funnel, i)
@@ -146,51 +127,77 @@ getInnerQuery <- function(funnel, i = 2) {
     nextlinks <- ""
   }
 
-  structure(bindParams("select ring, datetime as datetime{$i} {$links1} {$links2}
+  datetimes <- "datetime as datetime{$i}"
+  datetimeNames <- paste0("datetime", i)
+  if (length(step$condition) > 1) {
+    datetimes <- paste0(datetimes, ",",
+                       paste0("caseWithoutExpr(", step$condition, ", datetime, toDateTime(0)) as datetime{$i}_", seq_along(step$condition), collapse = ","))
+    datetimeNames <- c(datetimeNames, paste0("datetime", i, "_", seq_along(step$condition)))
+  }
+
+  structure(bindParams("select ring, {$datetimes} {$links1} {$links2}
 from local.access_log
 where date = '{$dt}'
   and ({$conditions})
-  {$sample}",
+  {$sample}
+  {$split}",
+                       datetimes = datetimes,
                        i = i,
                        links1 = prevlinks,
                        links2 = nextlinks,
                        conditions = paste0("(", step$condition, ")", collapse = " or ")),
-            join = join)
+            join = join,
+            datetimes = datetimeNames)
 }
 
-buildQueryForStep <- function(funnel, i = 1L) {
+buildQueryForStep <- function(funnel, i = 1L, allPath = FALSE) {
+  if (allPath) {
+    stop("Not implemented")
+    # TODO: implement :)
+  }
+
   steps <- sum(str_detect(names(funnel), regex("step[0-9]+")))
 
   if (i == 1L) {
     # Особый случай - 1ое правило
     step <- funnel[[paste0("step", i)]]
     links <- getNextLinks(funnel, 1)
-    right <- buildQueryForStep(funnel, i + 1)
-
+    right <- buildQueryForStep(funnel, i + 1, allPath)
     if (is.null(links)) {
       links <- ""
     } else {
       links <- paste0(",", printConditions(links))
     }
-    otherdates <- paste0("caseWithoutExpr(datetime", (i + 1):steps, " >= datetime", i, ", datetime", (i + 1):steps, ", toDateTime(0)) as datetime", (i + 1):steps, collapse = ",")
+    datetimes <- "datetime as datetime1"
+    datetimeNames <- "datetime1"
+    stepsRing <- "uniq(ring) as step1"
+    if (length(step$condition) > 1) {
+      datetimes <- paste0(datetimes, ",",
+                          paste0("caseWithoutExpr(", step$condition, ", datetime, toDateTime(0)) as datetime1_", seq_along(step$condition), collapse = ","))
+      datetimeNames <- c(datetimeNames, paste0("datetime1_", seq_along(step$condition)))
+      stepsRing <- c(stepsRing,
+                     paste0("uniqIf(ring, ", datetimeNames, " <> toDateTime(0)"))
+    }
 
-    stepsRing <- paste0("uniqIf(ring, ", sapply((i + 1):steps, function(si) {
-      paste0("datetime", 1:(si - 1), " <= datetime", 2:(si), collapse = " and ")
-    }), ") as step", (i + 1):steps, collapse = ",")
+    otherdates <- paste0("caseWithoutExpr(", attr(right, "datetimes"), " >= datetime1, ", attr(right, "datetimes"), ", toDateTime(0)) as ", attr(right, "datetimes"), collapse = ",")
+
+    stepsRing <- c(stepsRing,
+                   paste0("uniqIf(ring, ", attr(right, "datetimes"), " <> toDateTime(0)) as ", sub("datetime", "step", attr(right, "datetimes"))))
 
     bindParams("select
-  uniq(ring) as step1,
   {$stepsRing}
 from (
-  select ring, datetime as datetime1, {$otherdates}  {$links}
+  select ring, {$datetimes}, {$otherdates}  {$links}
 from bazalogs.access_log
   {$right}
 where date = '{$dt}'
   and ({$condition})
   {$sample}
+  {$split}
   and {$basecondition}
 )",
-               stepsRing = stepsRing,
+               stepsRing = paste0(stepsRing, collapse = ","),
+               datetimes = datetimes,
                otherdates = otherdates,
                links = links,
                right = right,
@@ -201,33 +208,40 @@ where date = '{$dt}'
 
   } else if (i == steps) {
     # Особый случай - последнее правило
-    query <- getInnerQuery(funnel, i)
-    bindParams("all left join (
+    query <- getInnerQuery(funnel, i, allPath)
+    structure(bindParams("all left join (
   {$subquery}
 ) using {$join}",
-               subquery = query,
-               join = paste0(attr(query, "join"), collapse = ","))
+                         subquery = query,
+                         join = paste0(attr(query, "join"), collapse = ",")),
+              datetimes = attr(query, "datetimes"))
   } else {
-    left <- getInnerQuery(funnel, i)
-    right <- buildQueryForStep(funnel, i + 1)
-    otherdates <- paste0("caseWithoutExpr(datetime", (i + 1):steps, " >= datetime", i, ", datetime", (i + 1):steps, ", toDateTime(0)) as datetime", (i + 1):steps, collapse = ",")
+    left <- getInnerQuery(funnel, i, allPath)
+    right <- buildQueryForStep(funnel, i + 1, allPath)
+    otherdates <- paste0("caseWithoutExpr(", attr(right, "datetimes"), " >= datetime", i, ", ", attr(right, "datetimes"), ", toDateTime(0)) as ", attr(right, "datetimes"), collapse = ",")
 
-    bindParams("all left join (
-  select distinct ring, datetime{$i}, {$otherdates}
+    structure(bindParams("all left join (
+  select distinct ring, {$datetimes}, {$otherdates}
   from (
     {$left}
   )
     {$right}
 ) using {$join}",
-               i = i,
-               otherdates = otherdates,
-               left = left,
-               right = right,
-               join = paste0(attr(left, "join"), collapse = ","))
+                         datetimes = paste0(attr(left, "datetimes"), collapse = ","),
+                         i = i,
+                         otherdates = otherdates,
+                         left = left,
+                         right = right,
+                         join = paste0(attr(left, "join"), collapse = ",")),
+              datetimes = c(attr(left, "datetimes"), attr(right, "datetimes")))
   }
 }
 
-getFunnelQuery <- function(funnel, steps = sum(str_detect(names(funnel), regex("step[0-9]+")))) {
+## TODO: link$type == "time less"
+## TODO: link$type == "time more"
+getFunnelQuery <- function(funnel,
+                           steps = sum(str_detect(names(funnel), regex("step[0-9]+"))),
+                           allPath = FALSE) {
   if (steps == 0L) {
     # special case
     structure(bindParams("select count() as base from ({$subquery})",
@@ -239,31 +253,43 @@ getFunnelQuery <- function(funnel, steps = sum(str_detect(names(funnel), regex("
 from bazalogs.access_log
 where date = '{$dt}'
   and ring in ({$base})
-  {sample}",
+  {sample}
+  {$split}",
                          step1 = printConditions(createConditions(funnel, "step1")),
                          base = funnel$base),
               sample = FALSE)
-  } else if (steps == 2L && is.null(funnel[["step2"]]$link)) {
+  } else if (FALSE && steps == 2L && is.null(funnel[["step2"]]$link)) {
     # special case
     step1 <- createConditions(funnel, "step1", "mindate")
     step2 <- createConditions(funnel, "step2", "maxdate")
 
     coConoditions <- list()
-    for (s1 in names(step1)) {
-      for (s2 in names(step2)) {
-        coConoditions[[paste0(s1, "__", s2)]] <- paste0(formatCondition("{$condition} <> toDateTime(0)", step1[s1]), " and ", step1[s1], " <= ", step2[s2])
+    if (allPath) {
+      # INFO: касательно этого места есть мнение, что нам не нужны все переборы - типа напишем если надо
+      # Поэтому мы исключаем полный перебор комбинаций и оставляем только прямую связ
+      for (s1 in names(step1)) {
+        for (s2 in names(step2)) {
+          coConoditions[[paste0(s1, "__", s2)]] <- paste0(formatCondition("{$condition} <> toDateTime(0)", step1[s1]), " and ", step1[s1], " <= ", step2[s2])
+        }
+      }
+    } else {
+      for (s1 in grep("^step[0-9]+$", names(step1), value = TRUE)) {
+        for (s2 in names(step2)) {
+          coConoditions[[paste0(s1, "__", s2)]] <- paste0(formatCondition("{$condition} <> toDateTime(0)", step1[s1]), " and ", step1[s1], " <= ", step2[s2])
+        }
       }
     }
     coConoditions <- unlist(coConoditions)
 
-    structure(bindParams("select count() as base, {step1}, {step2}
+    structure(bindParams("select count() as base, {$step1}, {$step2}
 from (
   select
-    ring, {step1inner}, {step2inner}
+    ring, {$step1inner}, {$step2inner}
   from bazalogs.access_log
   where date = '{$dt}'
     and ring in ({$base})
     {$sample}
+    {$split}
   group by ring
 )",
                          step1 = printConditions(formatCondition("sum({$condition})", names(step1))),
@@ -274,12 +300,21 @@ from (
               sample = FALSE)
   } else {
     # common case
-    structure(buildQueryForStep(funnel), sample = TRUE)
+    structure(buildQueryForStep(funnel, 1L, allPath), sample = TRUE)
   }
 }
 
-getFunnelDataDay <- function(funnel, dt) {
-  if (is.null(funnel$data) || funnel$data[date == dt, sum(sample)] < 1) {
+getFunnelDataDay <- function(funnel, dt, split = c("full", "2", "4", "8", "16")) {
+  split <- match.arg(split)[1]
+  if (split == "full") {
+    splitCondition <- ""
+  } else {
+    # TODO: проблема с пробелами. Привет Алексею
+    splitCondition <- paste0("and (", paste0("ring like '%", 16 - 1:(16 / as.integer(split)), " '", collapse = " or "), ")")
+  }
+
+  dataname <- paste0("split", split)
+  if (is.null(funnel[[dataname]]) || funnel[[dataname]][date == dt, sum(sample)] < 1) {
     query <- getFunnelQuery(funnel)
 
     # param binding
@@ -288,35 +323,159 @@ getFunnelDataDay <- function(funnel, dt) {
 
     con <- dbConnect(clickhouse(), host = "clickhouse-n1.dev")
     if (sample) {
-      if (is.null(funnel$data)) {
+      if (is.null(funnel[[dataname]])) {
         idx <- 0
       } else {
-        idx <- round(funnel$data[date == dt, sample] * 256 + 1)
+        idx <- funnel[[dataname]][date == dt, sample]
+        if (is.null(idx) || length(idx) == 0) {
+          idx <- 0
+        } else {
+          idx <- round(idx * 256)
+        }
       }
       sampleCondition <- paste0("and ring like '", format(as.hexmode(idx), 2), "%'")
-      data <- dbGetQuery(con,
-                         bindParams(query, sample = sampleCondition))
+      query <- bindParams(query, sample = sampleCondition, split = splitCondition)
       queryBase <- bindParams(getFunnelQuery(funnel, 0),
                               sample = sampleCondition,
+                              split = splitCondition,
                               dt = dt,
                               localSwitch = "local")
-      data <- cbind(data,
+      data <- cbind(dbGetQuery(con, query),
                     dbGetQuery(con, queryBase))
 
-      data[, `:=`(date = dt, sample = idx / 256)]
-      funnel$data <- rbind(funnel$data,
-                           data)[, c(base = sum(base),
-                                     sample = max(sample),
-                                     lapply(.SD, sum)),
-                                 by = date,
-                                 .SDcols = grep("step", names(data), value = TRUE)]
+      data[, `:=`(date = dt, sample = (idx + 1) / 256)]
+      funnel[[dataname]] <- rbind(funnel[[dataname]],
+                                  data)[, c(base = sum(base),
+                                            sample = max(sample),
+                                            lapply(.SD, sum)),
+                                        by = date,
+                                        .SDcols = grep("step", names(data), value = TRUE)]
     } else {
-      data <- dbGetQuery(con, bindParams(query, sample = ""))
+      query <- bindParams(query, sample = "", split = splitCondition)
+      data <- dbGetQuery(con, query)
       data[, `:=`(date = dt, sample = 1)]
-      funnel$data <- rbind(funnel$data, data)
+      funnel[[dataname]] <- rbind(funnel[[dataname]] , data)
     }
     dbDisconnect(con)
   }
 
   funnel
+}
+
+getFunnelName <- function(funnel) {
+  digest::digest(funnel[grep("base|step", names(funnel), value = TRUE)])
+}
+
+saveFunnel <- function(funnel) {
+  name <- getFunnelName(funnel)
+  saveRDS(funnel, bindParams("funnels/{$name}.RFunnelData", name = name))
+  TRUE
+}
+
+loadFunnel <- function(name) {
+  suppressWarnings(tryCatch(readRDS(bindParams("funnels/{$name}.RFunnelData", name = name)), error = function(e) { NULL }))
+}
+
+initFunnel <- function(funnel) {
+  name <- getFunnelName(funnel)
+  saveFunnel(funnel)
+  name
+}
+
+putFunnelLock <- function(name) {
+  file.create(bindParams("funnels/{$name}.lock", name = name))
+}
+
+releaseFunnelLock <- function(name) {
+  suppressWarnings(file.remove(bindParams("funnels/{$name}.lock", name = name)))
+}
+
+isFunnelLocked <- function(name) {
+  file.exists(bindParams("funnels/{$name}.lock", name = name))
+}
+
+getFunnelDataPeriod <- function(name, from = Sys.Date() - 1, to = Sys.Date() - 1, split = c("full", "2", "4", "8", "16")) {
+  split <- match.arg(split)[1]
+  funnel <- loadFunnel(name)
+  dataname <- paste0("split", split)
+
+  if (!is.null(funnel)) {
+    dts <- as.character(seq(as.Date(from), as.Date(to), "1 day"))
+    ord <- c(4, 3, 6, 1, 5, 2, 7) # magic: порядок дней среды, пятницы, понедельники, вс, чт, вт, сб для wday, которая америк. дни возвращает 2 (пн) - 6 (сб), 1 (вс)
+
+    dts <- setorder(data.table(dt = dts, ord = ord[wday(dts)]), ord, -dt)[, dt]
+
+    putFunnelLock(name)
+    tryCatch({
+      while (length(dts) > 0 && isFunnelLocked(name)) {
+        dt <- dts[1]
+
+        funnel <- getFunnelDataDay(funnel, dt)
+        if (split != "full") {
+          funnel <- getFunnelDataDay(funnel, dt, split)
+        }
+
+        if (funnel[[dataname]][date == dt, sample] < 1) {
+          # continue
+          dts <- c(dts[-1], dts[1])
+        } else {
+          dts <- dts[-1]
+        }
+
+        saveFunnel(funnel)
+      }
+    }, finally = function() {
+      releaseFunnelLock(name)
+    })
+  } else {
+    stop("No funnel found")
+  }
+
+  funnel
+}
+
+getRingExamples <- function(funnel, dt = Sys.Date() - 1, step = "step1", limit = 10) {
+
+}
+
+getABFunelResult <- function(funnel, from = NULL, to = NULL, lift = 0, step = Inf, split = c("2", "4", "8", "16")) {
+  estBetaParams <- function(x) {
+    mu <- mean(x)
+    var <- 0.005
+    alpha <- ((1 - mu) / var - 1 / mu) * mu ^ 2
+    beta <- alpha * (1 / mu - 1)
+    list(alpha = alpha, beta = beta)
+  }
+
+  steps <- sum(str_detect(names(funnel), regex("step[0-9]+")))
+  cStep <- paste0("step", pmin(steps, step))
+  cPrev <- ifelse(cStep == "step1", "base", paste0("step", pmin(steps, step) - 1))
+  split <- match.arg(split)
+  splitname <- paste0("split", split)
+  if (is.null(from)) {
+    from <- funnel$splitfull[, min(date)]
+  }
+  if (is.null(to)) {
+    to <- funnel$splitfull[, max(date)]
+  }
+
+  p <- estBetaParams(funnel$splitfull[date >= from & date <= to, get(cStep) / get(cPrev)])
+  aConv <- sum(funnel$splitfull[date >= from & date <= to, get(cStep)] - funnel[[splitname]][date >= from & date <= to, get(cStep)])
+  aAll <- sum(funnel$splitfull[date >= from & date <= to, get(cPrev)] - funnel[[splitname]][date >= from & date <= to, get(cPrev)])
+  bConv <- sum(funnel[[splitname]][date >= from & date <= to, get(cStep)])
+  bAll <- sum(funnel[[splitname]][date >= from & date <= to, get(cPrev)])
+
+  a_probs <- rbeta(1e5,
+                   aConv + p$alpha,
+                   aAll - aConv + p$beta)
+  b_probs <- rbeta(1e5,
+                   bConv + p$alpha,
+                   bAll - bConv + p$beta)
+
+  sampleLift <- (b_probs - a_probs) / a_probs
+
+  list(probBLiftOrMore = mean((100 * sampleLift > lift)),
+       liftQuantiles = quantile(sampleLift, c(0.05, 0.5, 0.95)),
+       a_info = quantile(a_probs, c(0.025, 0.5, 0.975)),
+       b_info = quantile(b_probs, c(0.025, 0.5, 0.975)))
 }

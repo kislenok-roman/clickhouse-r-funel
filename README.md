@@ -13,4 +13,6 @@ url like '/apply/payments/using/card%'
 
 * It fails a lot (A LOT) for us because of it's inner limitations (1 000 000 iterations per session)
 
+* It fails for funnel that requires dependancy other then time between steps. Ex.: referrer == previous(url)  
+
 I try to use joins instead with some smart (I want to think so) sampling.
